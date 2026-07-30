@@ -17,6 +17,8 @@ from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.spec_decode.llm_base_proposer import greedy_sample
 from vllm_ascend.worker.v2.sample.gumbel import gumbel_sample
 
+DSPARK_MARKOV_PADDING_TOKEN_ID = 0
+
 
 class AscendDSparkProposer(AscendDflashProposer):
     """DeepSeek V4 DSpark block proposer.
@@ -651,9 +653,28 @@ class AscendDSparkProposer(AscendDflashProposer):
         )
 
     def _pad_dspark_decode_inputs(self, num_tokens: int, num_input_tokens: int) -> None:
-        if num_input_tokens <= num_tokens:
+        if num_input_tokens < num_tokens:
+            raise ValueError(
+                "DSpark graph input tokens cannot be smaller than actual tokens: "
+                f"actual={num_tokens}, graph={num_input_tokens}."
+            )
+        if num_input_tokens == num_tokens:
             return
-        self.input_ids[num_tokens:num_input_tokens].fill_(self.parallel_drafting_token_id)
+
+        tokens_per_request = self.num_speculative_tokens
+        num_padding_tokens = num_input_tokens - num_tokens
+        if num_padding_tokens % tokens_per_request != 0:
+            raise ValueError(
+                "DSpark graph padding must contain complete request blocks: "
+                f"padding_tokens={num_padding_tokens}, tokens_per_request={tokens_per_request}."
+            )
+
+        padding_input_ids = self.input_ids[num_tokens:num_input_tokens].view(-1, tokens_per_request)
+        padding_input_ids.fill_(self.parallel_drafting_token_id)
+        # The first token of each request is also the initial Markov
+        # embedding index. The DSpark noise token can be outside the Markov
+        # vocabulary, so use an ordinary vocabulary token for padded requests.
+        padding_input_ids[:, 0].fill_(DSPARK_MARKOV_PADDING_TOKEN_ID)
         self.positions[num_tokens:num_input_tokens].zero_()
         self._request_slots_buffer[num_tokens:num_input_tokens].zero_()
         self._slot_mapping_buffer[num_tokens:num_input_tokens].zero_()
