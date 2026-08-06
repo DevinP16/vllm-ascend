@@ -49,8 +49,9 @@ class CompactDist:
         Returns:
             [B] float32 tensor of logprob values (or -inf on miss).
         """
-        hit = self.token_index == vocab_ids.long().unsqueeze(-1)
-        pos = hit.long().argmax(dim=-1)  # [B]
+        vocab_ids = vocab_ids.to(dtype=self.token_index.dtype)
+        hit = self.token_index == vocab_ids.unsqueeze(-1)
+        pos = hit.to(torch.int32).argmax(dim=-1)  # [B]
         val = self.logprobs.gather(
             1, pos.unsqueeze(1)
         ).squeeze(1)  # [B]

@@ -31,6 +31,9 @@ from vllm_ascend.sample.topk_map import CompactDist
 
 __all__ = ["build_compact_for_logprobs", "force_topk_sample"]
 
+# Larger compiled softmax kernels overflow 910B unified-buffer capacity.
+_MAX_COMPILED_TOPK = 4096
+
 
 def build_compact_for_logprobs(
     logits: torch.Tensor, k: int
@@ -60,7 +63,6 @@ def _apply_sampling_constraints(
     top_p: torch.Tensor,
     top_k: torch.Tensor,
     min_p: torch.Tensor | None,
-    true_p: torch.Tensor,
     k: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -72,9 +74,6 @@ def _apply_sampling_constraints(
         top_p: [B] float32, per-request (1.0 = disabled).
         top_k: [B] int32, per-request (<=0 = disabled -> use k).
         min_p: [B] float32 or None, per-request.
-        true_p: [B, k] float32, probabilities for nucleus/min_p.
-            raw mode: exp(topv - lse_full) (full-vocab normalized).
-            processed mode: softmax(topv) (k-dim normalized).
         k: candidate ceiling.
         device: NPU device.
 
@@ -86,7 +85,14 @@ def _apply_sampling_constraints(
     # Temperature scaling
     s = topv / temperature.unsqueeze(1)  # [B, k]
 
-    neg = torch.finfo(s.dtype).min
+    neg = float("-inf")
+
+    # min_p is applied after temperature and before top_k/top_p in vLLM.
+    # Normalizing over k does not change the probability ratio to top-1.
+    if min_p is not None:
+        min_p_probs = torch.softmax(s, dim=-1)
+        threshold = min_p[:, None] * min_p_probs[:, :1]
+        s = s.masked_fill(min_p_probs < threshold, neg)
 
     # top_k: mask ranks >= min(top_k, k). Already descending, just cut.
     k_cap = torch.where(
@@ -94,20 +100,16 @@ def _apply_sampling_constraints(
         torch.minimum(top_k, torch.full_like(top_k, k)),
         torch.full_like(top_k, k),
     )  # [B] int32
-    rank = torch.arange(k, device=device)  # [k]
+    rank = torch.arange(k, device=device, dtype=top_k.dtype)  # [k]
     s = s.masked_fill(rank[None, :] >= k_cap[:, None], neg)  # [B, k]
 
-    # top_p: nucleus based on true probabilities.
+    # vLLM applies top_p after top_k and normalizes over the remaining logits.
+    top_p_probs = torch.softmax(s, dim=-1)
     # keep[r] = (cumulative prob BEFORE r) < top_p,
     # includes threshold-crossing item.
-    cdf = true_p.cumsum(dim=-1)  # [B, k]
-    keep = (cdf - true_p) < top_p[:, None]  # [B, k]
+    cdf = top_p_probs.cumsum(dim=-1)  # [B, k]
+    keep = (cdf - top_p_probs) < top_p[:, None]  # [B, k]
     s = s.masked_fill(~keep, neg)  # [B, k]
-
-    # min_p: threshold = min_p * max_prob. max is top1 (already in top-k).
-    if min_p is not None:
-        thr = min_p[:, None] * true_p[:, :1]  # [B, 1]
-        s = s.masked_fill(true_p < thr, neg)  # [B, k]
 
     # Softmax over k candidates (renormalization after masking)
     probs_k = torch.softmax(s, dim=-1)  # [B, k]
@@ -147,7 +149,43 @@ def _sample(
     ).squeeze(1).to(torch.int64)  # [B]
     return sampled
 
-@torch.compile(dynamic=True, options={"npu_backend": "ascendc"})
+
+def _force_topk_tensors(
+    logits: torch.Tensor,
+    temperature: torch.Tensor,
+    top_p: torch.Tensor,
+    top_k: torch.Tensor,
+    min_p: torch.Tensor | None,
+    lse_full: torch.Tensor | None,
+    k: int,
+    return_raw_logprobs: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build the compact distribution using tensor-only operations."""
+    _, V = logits.shape
+    k = min(k, V)
+
+    topv, token_index = torch.topk(logits, k, dim=-1)  # [B, k] desc
+
+    s_masked, probs_k = _apply_sampling_constraints(
+        topv, temperature, top_p, top_k, min_p,
+        k, logits.device,
+    )
+
+    if return_raw_logprobs:
+        assert lse_full is not None
+        logprobs = topv - lse_full
+    else:
+        logprobs = torch.log_softmax(s_masked, dim=-1)
+    return probs_k, token_index, logprobs
+
+
+_compiled_force_topk_tensors = torch.compile(
+    _force_topk_tensors,
+    dynamic=False,
+    options={"npu_backend": "ascendc"},
+)
+
+
 def force_topk_sample(
     logits: torch.Tensor,
     temperature: torch.Tensor,
@@ -160,69 +198,33 @@ def force_topk_sample(
 ) -> tuple[torch.Tensor, CompactDist]:
     """Sample from logits using the force_topk compact-space path.
 
-    All sampling logic (temperature, top_k, top_p, min_p, Gumbel-max) is
-    performed in the [B, k] local-rank space after a single full-vocab topk.
-    The returned CompactDist carries the vocab-id restoration mapping and
-    logprobs (raw or processed depending on return_raw_logprobs).
-
-    Args:
-        logits: [B, V] float32, post-logits-processors,
-            **pre-temperature**.
-        temperature: [B] float32, per-request temperature.
-        top_p: [B] float32, per-request (1.0 = disabled).
-        top_k: [B] int32, per-request (<=0 = disabled -> use k).
-        min_p: [B] float32 or None, per-request (None = disabled).
-        generators: per-request torch.Generator dict (may be empty).
-        k: global candidate ceiling
-            (env VLLM_ASCEND_SAMPLER_FORCE_TOPK).
-        return_raw_logprobs: if True, logprobs = topv - LSE(z_raw)
-            (full-vocab normalized, requires full-vocab logsumexp).
-            If False, logprobs = log_softmax(s_masked) (processed,
-            k-dim only, no full-vocab scan).
-
-    Returns:
-        (sampled, cdist):
-          sampled: [B] int64, sampled vocab ids.
-          cdist: CompactDist with token_index [B, k] i32 and
-              logprobs [B, k] f32.
+    Tensor-only candidate processing is compiled. Generator-aware random
+    sampling remains eager because torch.Generator cannot be represented in
+    the compiled graph.
     """
     B, V = logits.shape
     k = min(k, V)
-
-    # Phase 1: top-k candidates (the only O(V log k) operation)
-    topv, token_index = torch.topk(logits, k, dim=-1)  # [B, k] desc
-
-    # Phase 2: raw logprobs + true_p
-    # (only when return_raw_logprobs=True)
     if return_raw_logprobs:
-        lse_full = torch.logsumexp(
-            logits, dim=-1, keepdim=True
-        )  # [B, 1] full-vocab LSE
-        raw_logprobs = topv - lse_full  # [B, k] raw logprob
-        true_p = torch.exp(
-            topv - lse_full
-        )  # [B, k] full-vocab normalized probs
+        # Dynamic full-vocab reductions are not supported by the Ascend
+        # Triton backend used by this image, so keep this reduction eager.
+        lse_full = torch.logsumexp(logits, dim=-1, keepdim=True)
     else:
-        raw_logprobs = None
-        true_p = torch.softmax(topv, dim=-1)  # [B, k] k-dim normalized
+        lse_full = None
 
-    # Phase 3: apply sampling constraints
-    s_masked, probs_k = _apply_sampling_constraints(
-        topv, temperature, top_p, top_k, min_p,
-        true_p, k, logits.device,
+    tensor_path = (
+        _force_topk_tensors
+        if k > _MAX_COMPILED_TOPK
+        else _compiled_force_topk_tensors
     )
-
-    # Phase 4: random sampling
+    probs_k, token_index, logprobs = tensor_path(
+        logits,
+        temperature,
+        top_p,
+        top_k,
+        min_p,
+        lse_full,
+        k,
+        return_raw_logprobs,
+    )
     sampled = _sample(probs_k, generators, B, token_index)
-
-    # Phase 5: select logprobs based on mode
-    if return_raw_logprobs:
-        logprobs = raw_logprobs  # topv - LSE(z_raw)
-    else:
-        logprobs = torch.log_softmax(
-            s_masked, dim=-1
-        )  # log_softmax(s_masked): processed
-
-    return sampled, CompactDist(
-        token_index.to(torch.int32), logprobs
-    )
+    return sampled, CompactDist(token_index.to(torch.int32), logprobs)

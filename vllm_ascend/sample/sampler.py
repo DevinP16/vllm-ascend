@@ -316,10 +316,13 @@ class AscendSampler(Sampler):
         )  # [B, n]
 
         # Single search: find sampled token position in token_index.
+        compact_token_ids = token_ids.to(
+            dtype=cdist.token_index.dtype
+        )
         hit = (
-            cdist.token_index == token_ids.long().unsqueeze(-1)
+            cdist.token_index == compact_token_ids.unsqueeze(-1)
         )  # [B, k]
-        pos = hit.long().argmax(dim=-1)  # [B]
+        pos = hit.to(torch.int32).argmax(dim=-1)  # [B]
         found = hit.any(dim=-1)  # [B]
 
         val = cdist.logprobs.gather(
@@ -337,12 +340,11 @@ class AscendSampler(Sampler):
         )
 
         indices = torch.cat(
-            (token_ids.unsqueeze(-1), topk_indices), dim=1
+            (compact_token_ids.unsqueeze(-1), topk_indices), dim=1
         )
         logprobs_cat = torch.cat(
             (token_logprobs.unsqueeze(-1), topk_logprobs), dim=1
         )
-        indices = indices.to(torch.int32)
         return LogprobsTensors(
             indices, logprobs_cat, token_ranks
         )
